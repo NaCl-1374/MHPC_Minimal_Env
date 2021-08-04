@@ -1,0 +1,282 @@
+#include "PlanarQuadruped.h"
+#include "Casadi_dynamics.h"
+#include <vector>
+
+PlanarQuadruped::PlanarQuadruped(double dt):
+RobotBase(dt,
+          cheetah2D::num_config,
+          2*cheetah2D::num_config,
+          cheetah2D::num_act_joint, 
+          2*cheetah2D::num_leg,
+          ModelType::FULL)
+{    
+
+    _Ac = SpMat(_dim_state, _dim_state);
+    _Bc = SpMat(_dim_state, _dim_control);
+    _C = SpMat(_dim_output, _dim_state);
+    _D = SpMat(_dim_output, _dim_control);
+    _Px = SpMat(_dim_state, _dim_state);
+    _Pu = SpMat(_dim_state, _dim_control);
+    _gx = SpMat(_dim_output, _dim_state);
+    _gu = SpMat(_dim_output, _dim_control);
+    _J = SpMat(_dim_output, _dim_config);
+    _Jd = SpMat(_dim_output, _dim_config);
+    I14 = SpMat(_dim_state, _dim_state);
+    I7 = SpMat(_dim_config, _dim_config);
+    I4 = SpMat(_dim_control, _dim_control);
+
+    I14.setIdentity();
+    I7.setIdentity();
+    I4.setIdentity();
+
+    memory_alloc();
+}
+
+void PlanarQuadruped::memory_alloc()
+{
+    vector<SpMat> mat;
+    mat = {_J, _Jd};
+    initialize_mat(Jacob_B_sparsity_out, mat);
+
+    mat = {_Ac, _Bc, _C, _D};
+    initialize_mat(Dyn_BS_sparsity_out, mat);
+
+    mat = {_Px, _Pu, _gx, _gu};
+    initialize_mat(Imp_B_sparsity_out, mat);
+}
+
+void PlanarQuadruped::initialize_mat(const int_T *f_sparse_out(int_T), vector<SpMat> &mat)
+{
+    const int n_out = mat.size();
+    size_t idx_out, colidx, idx_nz;
+    size_t rows, cols, nnz;
+
+    const int_T *spStruct;
+    const int_T *colOffsets;
+    const int_T *rowInfo;
+
+    for (idx_out = 0; idx_out < n_out; idx_out++)
+    {
+        spStruct = f_sparse_out(idx_out);
+        rows = spStruct[0];
+        cols = spStruct[1];
+
+        colOffsets = spStruct + 2;
+        nnz = colOffsets[cols];
+        rowInfo = colOffsets + cols + 1;
+
+        idx_nz = 0;
+        mat[idx_out].reserve(nnz);
+
+        for (colidx = 0; colidx < cols; colidx++)
+        {
+            while (idx_nz < colOffsets[colidx + 1])
+            {
+                mat[idx_out].insert(rowInfo[idx_nz], colidx) = 0;
+                idx_nz++;
+            }
+        }
+        mat[idx_out].makeCompressed();
+    }
+}
+
+void PlanarQuadruped::dynamics(DVec x, DVec u, DVec &x_next, DVec &y, int mode)
+{
+    double *arg[2], *res[2], *w = NULL;
+    int_T *iw = NULL;
+    int_T sz_arg, sz_res, sz_iw, sz_w;
+
+    arg[0] = x.data();
+    arg[1] = u.data();
+    res[0] = _fc.data();
+    res[1] = y.data();
+
+    switch (mode)
+    {
+    case 2:
+    case 4: // flight
+        Dyn_FL_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Dyn_FL((const double **)arg, res, iw, w, 1);
+        break;
+    case 1: // back stance
+        Dyn_BS_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Dyn_BS((const double **)arg, res, iw, w, 1);
+        break;
+    case 3: // front stance
+        Dyn_FS_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Dyn_FS((const double **)arg, res, iw, w, 1);
+        break;
+    }
+
+    /* Descrete-time dynamics*/
+    x_next = x + _fc * _dt;
+
+    if (iw)
+        delete[] iw;
+    if (w)
+        delete[] w;
+}
+
+void PlanarQuadruped::dynamics_par(DVec x, DVec u, SpMat &A, SpMat &B, SpMat &C, SpMat &D, int mode)
+{
+    double *arg[2], *res[4], *w = NULL;
+    int_T *iw = NULL;
+    int_T sz_arg, sz_res, sz_iw, sz_w;
+
+    arg[0] = x.data();
+    arg[1] = u.data();
+    res[0] = _Ac.valuePtr();
+    res[1] = _Bc.valuePtr();
+    res[2] = _C.valuePtr();
+    res[3] = _D.valuePtr();
+
+    switch (mode)
+    {
+    case 2:
+    case 4: // flight
+        Dyn_FL_par_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Dyn_FL_par((const double **)arg, res, iw, w, 1);
+        break;
+    case 1: // back stance
+        Dyn_BS_par_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Dyn_BS_par((const double **)arg, res, iw, w, 1);
+        break;
+    case 3: // front stance
+        Dyn_FS_par_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Dyn_FS_par((const double **)arg, res, iw, w, 1);
+        break;
+    }
+    
+    A = I14 + _Ac * _dt;
+    B = _Bc * _dt;
+    C = _C;
+    D = _D;
+
+    if (iw)
+        delete[] iw;
+    if (w)
+        delete[] w;
+}
+
+void PlanarQuadruped::resetmap(DVec x, DVec &x_next, DVec &y, int mode)
+{
+    Vec4d u = Vec4d::Zero();
+    double *arg[2], *res[2], *w = NULL;
+    int_T *iw = NULL;
+    int_T sz_arg, sz_res, sz_iw, sz_w;
+
+    arg[0] = x.data();
+    arg[1] = u.data();
+    res[0] = x_next.data();
+    res[1] = y.data();
+
+    switch (mode)
+    {
+    case 1:
+    case 3:
+        x_next = x;
+        break;
+    case 2: //front impact
+        Imp_F_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Imp_F((const double **)arg, res, iw, w, 1);
+        break;
+    case 4: // back impact
+        Imp_B_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Imp_B((const double **)arg, res, iw, w, 1);
+        break;
+    }
+
+    if (iw)
+        delete[] iw;
+    if (w)
+        delete[] w;
+}
+
+void PlanarQuadruped::resetmap_par(DVec x, SpMat &Px, SpMat &Pu, SpMat &gx, SpMat &gu, int mode)
+{
+    Vec4d u = Vec4d::Zero();
+    double *arg[2], *res[4], *w = NULL;
+    int_T *iw = NULL;
+    int_T sz_arg, sz_res, sz_iw, sz_w;
+
+    arg[0] = x.data();
+    arg[1] = u.data();
+    res[0] = Px.valuePtr();
+    res[1] = Pu.valuePtr();
+    res[2] = gx.valuePtr();
+    res[3] = gu.valuePtr();
+
+    switch (mode)
+    {
+    case 1:
+    case 3: // smooth transition
+        Px = I14;
+        Pu.setZero();
+        gx.setZero();
+        gu.setZero();
+        break;
+    case 2: // front impact
+        Imp_F_par_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Imp_F_par((const double **)arg, res, iw, w, 1);
+        break;
+    case 4: // back impact
+        Imp_B_par_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Imp_B_par((const double **)arg, res, iw, w, 1);
+        break;
+    }
+    
+    if (iw)
+        delete[] iw;
+    if (w)
+        delete[] w;
+}
+void PlanarQuadruped::FootJacobian(DVec x, SpMat &J, SpMat &Jd, int foot)
+{
+    double *arg, *res[2], *w = NULL;
+    int_T *iw = NULL;
+    int_T sz_arg, sz_res, sz_iw, sz_w;
+
+    arg = x.data();
+    res[0] = J.valuePtr();
+    res[1] = Jd.valuePtr();
+
+    if (1 == foot) // front foot
+    {
+        Jacob_F_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Jacob_F((const double **)arg, res, iw, w, 1);
+    }
+    else if (2 == foot) // back foot
+    {
+        Jacob_B_work(&sz_arg, &sz_res, &sz_iw, &sz_w);
+        iw = new int_T[sz_iw];
+        w = new double[sz_w];
+        Jacob_B((const double **)arg, res, iw, w, 1);
+    }
+
+    if (iw)
+        delete[] iw;
+    if (w)
+        delete[] w;
+}
